@@ -270,3 +270,141 @@ async def test_zeroconf_rediscovery_updates_host(hass: HomeAssistant):
 
     entry = hass.config_entries.async_entries(DOMAIN)[0]
     assert entry.data[CONF_TCP_HOSTNAME] == "192.168.1.200"
+
+
+# --- Meshtastic integration TCP proxy -------------------------------------
+
+_PATCH_TCP = (
+    "custom_components.meshtastic_ui.config_flow.MeshtasticUiConfigFlow._test_tcp_connection"
+)
+
+
+def _add_meshtastic_entry(hass: HomeAssistant, *, host: str, proxy: bool, port: int = 4403):
+    """Add a config entry of the Meshtastic integration (domain "meshtastic")."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(
+        domain="meshtastic",
+        title="MiFi3860",
+        unique_id="2410035296",
+        data={"connection_type": "tcp", "tcp_host": host, "tcp_port": 4403},
+        options={"tcp_proxy": {"enable": proxy, "port": port}},
+    )
+    entry.add_to_hass(hass)
+    return entry
+
+
+def _zeroconf(host: str, node_id: str = "!aabbccdd"):
+    from ipaddress import ip_address
+
+    from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
+
+    return ZeroconfServiceInfo(
+        ip_address=ip_address(host),
+        ip_addresses=[ip_address(host)],
+        hostname="meshtastic-ccdd.local.",
+        name="Meshtastic-ccdd._meshtastic._tcp.local.",
+        port=DEFAULT_TCP_PORT,
+        properties={"id": node_id},
+        type="_meshtastic._tcp.local.",
+    )
+
+
+_PROXY_DISCOVERY = {"host": "127.0.0.1", "port": 4403, "name": "MiFi3860", "node_id": "!AABBCCDD"}
+
+
+async def test_integration_discovery_proxy_creates_entry(hass: HomeAssistant):
+    """A proxy announced by the Meshtastic integration is offered and set up."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data=_PROXY_DISCOVERY,
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "proxy_confirm"
+    assert result["description_placeholders"]["host"] == "127.0.0.1"
+
+    with patch(_PATCH_TCP, return_value="!aabbccdd") as test_tcp:
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    test_tcp.assert_called_once_with("127.0.0.1", 4403)
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Meshtastic (MiFi3860 via proxy)"
+    assert result["data"] == {
+        CONF_CONNECTION_TYPE: "tcp",
+        CONF_TCP_HOSTNAME: "127.0.0.1",
+        CONF_TCP_PORT: 4403,
+    }
+    assert result["result"].unique_id == "!aabbccdd"
+
+
+async def test_integration_discovery_switches_direct_entry_to_proxy(hass: HomeAssistant):
+    """An entry connected directly to the radio is moved to the proxy."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="!aabbccdd",
+        data={CONF_CONNECTION_TYPE: "tcp", CONF_TCP_HOSTNAME: "192.168.1.66", CONF_TCP_PORT: 4403},
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data=_PROXY_DISCOVERY,
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+    assert entry.data[CONF_TCP_HOSTNAME] == "127.0.0.1"
+
+
+async def test_integration_discovery_already_on_proxy_address(hass: HomeAssistant):
+    """An entry already pointing at the proxy address is not offered again."""
+    from pytest_homeassistant_custom_component.common import MockConfigEntry
+
+    MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="tcp:127.0.0.1",
+        data={CONF_CONNECTION_TYPE: "tcp", CONF_TCP_HOSTNAME: "127.0.0.1", CONF_TCP_PORT: 4403},
+    ).add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_INTEGRATION_DISCOVERY},
+        data=_PROXY_DISCOVERY,
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
+
+
+async def test_zeroconf_radio_served_by_proxy_is_not_offered(hass: HomeAssistant):
+    """mDNS discovery of a radio the Meshtastic integration proxies is suppressed."""
+    _add_meshtastic_entry(hass, host="192.168.1.66", proxy=True)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_ZEROCONF},
+        data=_zeroconf("192.168.1.66"),
+    )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "served_by_meshtastic_proxy"
+
+
+async def test_zeroconf_radio_without_proxy_is_offered(hass: HomeAssistant):
+    """Without the proxy enabled (or for another radio) direct discovery still works."""
+    _add_meshtastic_entry(hass, host="192.168.1.66", proxy=False)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_ZEROCONF},
+        data=_zeroconf("192.168.1.66"),
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "zeroconf_confirm"
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_ZEROCONF},
+        data=_zeroconf("192.168.1.77", node_id="!11223344"),
+    )
+    assert result["type"] is FlowResultType.FORM

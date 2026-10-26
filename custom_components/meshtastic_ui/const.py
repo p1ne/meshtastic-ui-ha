@@ -2,6 +2,9 @@
 
 DOMAIN = "meshtastic_ui"
 
+# The Meshtastic integration, whose TCP proxy we can connect through
+MESHTASTIC_DOMAIN = "meshtastic"
+
 # Storage
 STORAGE_KEY = "meshtastic_ui.messages"
 STORAGE_VERSION = 1

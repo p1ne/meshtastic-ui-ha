@@ -27,13 +27,18 @@
       "zeroconf_confirm": {
         "title": "Set up Meshtastic radio",
         "description": "A Meshtastic radio was discovered on the network:\n\n**{name}**\n`{host}:{port}`\n\nDo you want to set it up?"
+      },
+      "proxy_confirm": {
+        "title": "Connect through Meshtastic proxy",
+        "description": "The Meshtastic integration shares the radio through its TCP proxy:\n\n**{name}**\n`{host}:{port}`\n\nConnect Meshtastic UI through this proxy? The radio keeps a single connection, shared by both integrations."
       }
     },
     "error": {
       "cannot_connect": "Unable to connect to the radio. Check the address and ensure the radio is powered on."
     },
     "abort": {
-      "already_configured": "Meshtastic UI is already configured."
+      "already_configured": "Meshtastic UI is already configured.",
+      "served_by_meshtastic_proxy": "This radio is already served by the Meshtastic integration's TCP proxy. Set up Meshtastic UI from the proxy discovery instead."
     }
   }
 }

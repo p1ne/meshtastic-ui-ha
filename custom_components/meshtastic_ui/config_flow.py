@@ -9,7 +9,9 @@ from typing import Any
 import voluptuous as vol
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
+from homeassistant.helpers.typing import DiscoveryInfoType
 
 from .const import (
     CONF_CONNECTION_TYPE,
@@ -18,6 +20,7 @@ from .const import (
     CONF_TCP_PORT,
     DEFAULT_TCP_PORT,
     DOMAIN,
+    MESHTASTIC_DOMAIN,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -38,6 +41,32 @@ def _node_id_from_properties(properties: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _normalize_node_id(raw: Any) -> str | None:
+    """Return a node ID as lowercase !hex, or None if it is not one."""
+    if isinstance(raw, str) and _NODE_ID_RE.fullmatch(raw.strip()):
+        return raw.strip().lower()
+    return None
+
+
+def _meshtastic_proxy_port_for_host(hass: HomeAssistant, host: str) -> int | None:
+    """Return the TCP proxy port if the Meshtastic integration already serves this radio.
+
+    The Meshtastic integration (domain ``meshtastic``) can hold the radio's TCP
+    connection and re-share it through a local TCP proxy. Radios accept only a
+    limited number of TCP clients, so Meshtastic UI should go through that proxy
+    instead of opening a second direct connection.
+    """
+    for entry in hass.config_entries.async_entries(
+        MESHTASTIC_DOMAIN, include_ignore=False, include_disabled=False
+    ):
+        if entry.data.get("connection_type") != "tcp" or entry.data.get("tcp_host") != host:
+            continue
+        proxy = entry.options.get("tcp_proxy") or {}
+        if proxy.get("enable"):
+            return int(proxy.get("port", DEFAULT_TCP_PORT))
+    return None
+
+
 class MeshtasticUiConfigFlow(ConfigFlow, domain=DOMAIN):
     """Config flow for Meshtastic UI integration."""
 
@@ -50,6 +79,7 @@ class MeshtasticUiConfigFlow(ConfigFlow, domain=DOMAIN):
         self._discovered_host: str | None = None
         self._discovered_port: int | None = None
         self._validated_node_id: str | None = None
+        self._entry_title: str | None = None
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Step 1: Choose connection type."""
@@ -79,6 +109,10 @@ class MeshtasticUiConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Handle mDNS/zeroconf discovery of a Meshtastic radio."""
         host = discovery_info.host
+        if _meshtastic_proxy_port_for_host(self.hass, host) is not None:
+            # The Meshtastic integration announces its proxy separately
+            # (integration discovery); don't offer a second direct connection.
+            return self.async_abort(reason="served_by_meshtastic_proxy")
         if discovery_info.type == "_meshtastic._tcp.local.":
             port = discovery_info.port or DEFAULT_TCP_PORT
         else:
@@ -106,10 +140,54 @@ class MeshtasticUiConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return await self.async_step_zeroconf_confirm()
 
+    async def async_step_integration_discovery(
+        self, discovery_info: DiscoveryInfoType
+    ) -> ConfigFlowResult:
+        """Handle a TCP proxy announced by the Meshtastic integration.
+
+        Expected data: ``host``, ``port`` and optionally ``name`` and
+        ``node_id`` (the radio's !hex ID).
+        """
+        host = str(discovery_info["host"])
+        port = int(discovery_info.get("port") or DEFAULT_TCP_PORT)
+        node_id = _normalize_node_id(discovery_info.get("node_id"))
+
+        # Already set up for this proxy address (e.g. entry keyed by IP)
+        self._async_abort_entries_match({CONF_TCP_HOSTNAME: host, CONF_TCP_PORT: port})
+        # Same radio set up directly: switch it to the proxy, so the radio is
+        # not held by two TCP clients.
+        await self.async_set_unique_id(node_id or f"tcp:{host}:{port}")
+        self._abort_if_unique_id_configured(
+            updates={CONF_TCP_HOSTNAME: host, CONF_TCP_PORT: port}
+        )
+
+        name = str(discovery_info.get("name") or node_id or host)
+        self._discovered_host = host
+        self._discovered_port = port
+        self._discovered_name = f"{name} (Meshtastic proxy)"
+        self._entry_title = f"Meshtastic ({name} via proxy)"
+        self.context["title_placeholders"] = {
+            "name": self._discovered_name,
+            "address": f"{host}:{port}",
+        }
+        return await self.async_step_proxy_confirm()
+
+    async def async_step_proxy_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Confirm connecting through the Meshtastic integration's TCP proxy."""
+        return await self._async_discovery_confirm("proxy_confirm", user_input)
+
     async def async_step_zeroconf_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Confirm zeroconf discovery."""
+        return await self._async_discovery_confirm("zeroconf_confirm", user_input)
+
+    async def _async_discovery_confirm(
+        self, step_id: str, user_input: dict[str, Any] | None
+    ) -> ConfigFlowResult:
+        """Validate the discovered address and create the entry."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -130,7 +208,7 @@ class MeshtasticUiConfigFlow(ConfigFlow, domain=DOMAIN):
                         }
                     )
                 return self.async_create_entry(
-                    title=f"Meshtastic ({self._discovered_host})",
+                    title=self._entry_title or f"Meshtastic ({self._discovered_host})",
                     data={
                         CONF_CONNECTION_TYPE: "tcp",
                         CONF_TCP_HOSTNAME: self._discovered_host,
@@ -139,7 +217,7 @@ class MeshtasticUiConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
 
         return self.async_show_form(
-            step_id="zeroconf_confirm",
+            step_id=step_id,
             description_placeholders={
                 "name": self._discovered_name,
                 "host": self._discovered_host,
